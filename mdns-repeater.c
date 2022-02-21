@@ -43,6 +43,7 @@
 
 struct if_sock {
     const char *   ifname; /* interface name  */
+    int            ifindex; /* interface index */
     int            sockfd; /* socket filedesc */
     struct in_addr addr;   /* interface addr  */
     struct in_addr mask;   /* interface mask  */
@@ -121,6 +122,7 @@ static int create_recv_sock()
     }
 
 #ifdef IP_PKTINFO
+    log_message(LOG_DEBUG, "enable IP_PKTINFO\n");
     if ((r = setsockopt(sd, SOL_IP, IP_PKTINFO, &on, sizeof(on))) < 0) {
         log_message(LOG_ERR, "recv setsockopt(IP_PKTINFO): %s",
                     strerror(errno));
@@ -167,6 +169,11 @@ static int create_send_sock(int recv_sockfd, const char *ifname,
     // .. and interface address
     if (ioctl(sd, SIOCGIFADDR, &ifr) == 0) {
         memcpy(&sockdata->addr, if_addr, sizeof(struct in_addr));
+    }
+
+    // .. and interface index
+    if (ioctl(sd, SIOCGIFINDEX, &ifr) == 0) {
+        sockdata->ifindex = ifr.ifr_ifindex;
     }
 
     // compute network (address & mask)
@@ -457,12 +464,25 @@ int main(int argc, char *argv[])
             continue;
 
         if (FD_ISSET(server_sockfd, &sockfd_set)) {
+            char cmbuf[0x100];
             struct sockaddr_in fromaddr;
-            socklen_t          sockaddr_size = sizeof(struct sockaddr_in);
+            int                fromifindex = -1;
 
-            ssize_t recvsize =
-                recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0,
-                         (struct sockaddr *)&fromaddr, &sockaddr_size);
+            struct iovec iov = {
+                .iov_base = pkt_data,
+                .iov_len = PACKET_SIZE,
+            };
+
+            struct msghdr mh = {
+                .msg_name = &fromaddr,
+                .msg_namelen = sizeof(fromaddr),
+                .msg_iov = &iov,
+                .msg_iovlen = 1,
+                .msg_control = cmbuf,
+                .msg_controllen = sizeof(cmbuf),
+            };
+
+            ssize_t recvsize = recvmsg(server_sockfd, &mh, 0);
             if (recvsize < 0) {
                 log_message(LOG_ERR, "recv(): %s", strerror(errno));
             }
@@ -480,14 +500,36 @@ int main(int argc, char *argv[])
             if (self_generated_packet)
                 continue;
 
-            log_message(LOG_DEBUG, "data from=%s size=%ld\n",
-                        inet_ntoa(fromaddr.sin_addr), recvsize);
+#ifdef IP_PKTINFO
+            // iterate through all the control headers
+            for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mh);
+                cmsg != NULL;
+                cmsg = CMSG_NXTHDR(&mh, cmsg))
+            {
+                // ignore the control headers that don't match what we want
+                if (cmsg->cmsg_level != IPPROTO_IP ||
+                    cmsg->cmsg_type != IP_PKTINFO)
+                    continue;
+                struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
+                fromifindex = pi->ipi_ifindex;
+            }
+#endif
+
+            log_message(LOG_DEBUG, "data from=%s size=%ld, ifindex=%d\n",
+                        inet_ntoa(fromaddr.sin_addr), recvsize, fromifindex);
+
 
             for (j = 0; j < num_socks; j++) {
                 // do not repeat packet back to the same network from which it
                 // originated
                 if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) ==
                     socks[j].net.s_addr)
+                    continue;
+
+                // If available, also check interface index to avoid duplicating
+                // packages with a source address not matching the known interface
+                // address (e.g. multiple IPs)
+                if (fromifindex > 0 && fromifindex == socks[j].ifindex)
                     continue;
 
                 log_message(LOG_DEBUG, "repeating data to %s\n",
