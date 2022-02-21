@@ -332,7 +332,7 @@ static void show_help(const char *progname)
     fprintf(stderr,
             "\n"
             "<ifdev> specifies an interface like \"eth0\"\n"
-            "packets received on an interface is repeated across all other "
+            "any received mDNS packets are repeated across all "
             "specified interfaces\n"
             "maximum number of interfaces is 5\n"
             "\n"
@@ -394,9 +394,9 @@ int main(int argc, char *argv[])
     parse_opts(argc, argv);
 
     int expected_socks = argc - optind;
-    if (expected_socks <= 1) {
+    if (expected_socks < 1) {
         show_help(argv[0]);
-        log_message(LOG_ERR, "error: at least 2 interfaces must be specified");
+        log_message(LOG_ERR, "error: at least one interface must be specified");
         exit(2);
     }
 
